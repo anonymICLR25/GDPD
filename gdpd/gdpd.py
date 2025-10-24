@@ -1,0 +1,108 @@
+import torch
+from torch import nn
+import torch.nn.functional as F
+from .gdpd_modules import DiffusionModel, NoiseAdapter, AutoEncoder, DDIMPipeline
+from .scheduling_ddim import DDIMScheduler
+import math
+
+
+class gdpd_network(nn.Module): 
+    def __init__(
+            self,
+            student,
+            mode,
+            student_channels,
+            teacher_channels,
+            kernel_size=3,
+            inference_steps=5,
+            num_train_timesteps=1000,
+            use_ae=False,
+            ae_channels=None,
+    ):
+        super().__init__()
+        self.use_ae = use_ae
+        self.diffusion_inference_steps = inference_steps
+        self.student=student
+        self.mode=mode
+        # AE for compress teacher feature
+        if use_ae:
+            if ae_channels is None:
+                ae_channels = teacher_channels // 2
+            self.ae = AutoEncoder(teacher_channels, ae_channels)
+            teacher_channels = ae_channels
+        
+        # transform student feature to the same dimension as the teacher
+        self.trans = nn.Conv2d(student_channels, teacher_channels, 1)
+        self.diffmodel = DiffusionModel(channels_in=teacher_channels, kernel_size=kernel_size)
+        self.scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps, clip_sample=False, beta_schedule="linear")
+        self.noise_adapter = NoiseAdapter(teacher_channels, kernel_size)
+        self.pipeline = DDIMPipeline(self.diffmodel, self.scheduler, self.noise_adapter)
+        self.proj = nn.Sequential(nn.Conv2d(teacher_channels, teacher_channels, 1), nn.BatchNorm2d(teacher_channels))
+
+    def forward(self, input, teacher_feat=None):
+        #get student features and initial logits
+        output_logits_init, student_feat, _, _, _= self.student(input,get_ha=True)
+
+        #make feature maps BCHW format:
+        student_feat=self._reshape_BCHW(student_feat)
+
+        # project student feature to the same dimension as teacher feature
+        student_feat = self.trans(student_feat)
+
+        # denoise student feature
+        denoised_feat = self.pipeline(
+            batch_size=student_feat.shape[0],
+            device=student_feat.device,
+            dtype=student_feat.dtype,
+            shape=student_feat.shape[1:],
+            feat=student_feat,
+            num_inference_steps=self.diffusion_inference_steps,
+            proj=self.proj
+        )
+ 
+        denoised_feat = self.proj(denoised_feat)
+        denoised_feat_temp = denoised_feat.squeeze(-1).squeeze(-1) #from BCHW to BC back
+        output_logits = self.student(input.clone(), context=denoised_feat_temp)
+        
+        if self.training:
+            teacher_feat=self._reshape_BCHW(teacher_feat)
+            if self.use_ae:
+                hidden_t_feat, rec_t_feat = self.ae(teacher_feat)
+                rec_loss = F.mse_loss(teacher_feat, rec_t_feat)
+                teacher_feat = hidden_t_feat.detach()
+            else:
+                rec_loss = None
+            # train diffusion model
+            ddim_loss = self.ddim_loss(teacher_feat)
+            return output_logits, output_logits_init, ddim_loss, rec_loss
+            
+        else:
+            return output_logits_init
+
+
+    def ddim_loss(self, gt_feat):
+        # Sample noise to add to the images
+        noise = torch.randn(gt_feat.shape, device=gt_feat.device) #.to(gt_feat.device)
+        bs = gt_feat.shape[0]
+
+        # Sample a random timestep for each image
+        timesteps = torch.randint(0, self.scheduler.num_train_timesteps, (bs,), device=gt_feat.device).long()
+        # Add noise to the clean images according to the noise magnitude at each timestep
+        noisy_images = self.scheduler.add_noise(gt_feat, noise, timesteps)
+        noise_pred = self.diffmodel(noisy_images, timesteps)
+        loss = F.mse_loss(noise_pred, noise)
+        return loss
+
+    def _reshape_BCHW(self, x):
+        """
+        Reshape a 2d (B, C) or 3d (B, N, C) tensor to 4d BCHW format.
+        """
+        if x.dim() == 2:
+            x = x.view(x.shape[0], x.shape[1], 1, 1)
+        elif x.dim() == 3:
+            # swin [B, N, C]
+            B, N, C = x.shape
+            H = W = int(math.sqrt(N))
+            x = x.transpose(-2, -1).reshape(B, C, H, W)
+        return x
+        
